@@ -148,9 +148,7 @@ class ResponsesBody(BaseModel):
 
     @staticmethod
     def transform_tools(
-        tools: dict | list | None = None,
-        *,
-        strict: bool = False,
+        tools: dict | list | None = None
     ) -> list[dict]:
         """
         Canonicalise any mixture of tool specs to the OpenAI Responses-API list.
@@ -204,19 +202,16 @@ class ResponsesBody(BaseModel):
             # c) Anything else (including web_search) → keep verbatim
             native.append(dict(item))
 
-        # 2. strict-mode hardening for the bits we just converted ----------
-        if strict:
-            for tool in converted:
+        # 2. strict-mode hardening per converted function tool -------------
+        # Each tool is evaluated independently; compliant ones get strict=True.
+        for tool in converted:
+            if ResponsesBody.validate_strict(tool):
                 params = tool.setdefault("parameters", {})
-                props  = params.setdefault("properties", {})
-                params["required"] = list(props)
-                params["additionalProperties"] = False
-                for schema in props.values():
-                    t = schema.get("type")
-                    schema["type"] = [t, "null"] if isinstance(t, str) else (
-                        t + ["null"] if isinstance(t, list) and "null" not in t else t
-                    )
+                if "additionalProperties" not in params:
+                    params["additionalProperties"] = False
                 tool["strict"] = True
+            else:
+                tool["strict"] = False
 
         # 3. deduplicate ---------------------------------------------------
         canonical: dict[str, dict] = {}
@@ -226,6 +221,93 @@ class ResponsesBody(BaseModel):
 
         return list(canonical.values())
 
+
+    @staticmethod
+    def validate_strict(tool: Dict[str, Any]) -> bool:
+        """Return True if the tool's JSON schema can be safely hardened for
+        OpenAI strict mode.
+
+                Heuristics (conservative – we only opt in if obviously safe):
+        - Tool type must be "function".
+        - parameters must be a dict (root object schema) with a non‑empty
+          "properties" dict.
+        - Reject if root or any property schema uses unsupported / complex
+          JSON Schema constructs (anyOf / oneOf / allOf / not / patternProperties
+          / dependencies / dependentSchemas / if / then / else).
+        - Reject if any schema's type is literally "anyof" (some bad exports
+                    put this into the type field) or if additionalProperties is truthy.
+                - In strict mode: additionalProperties MUST NOT be true or a schema at ANY level (root or nested).
+        - Reject object-typed properties that themselves have no properties
+          (ambiguous – would need user intent to mark required, so we skip).
+        - Allow optional null expansion; we will add "null" later when hardening.
+        """
+        try:
+            if not isinstance(tool, dict):
+                return False
+            if tool.get("type") != "function":
+                return False
+            params = tool.get("parameters")
+            if not isinstance(params, dict):
+                return False
+            # Root should describe an object (OpenAI examples omit type sometimes)
+            root_type = params.get("type", "object")
+            if root_type != "object":
+                return False
+            props = params.get("properties")
+            if not isinstance(props, dict):
+                return False  # must be dict (may be empty)
+
+            forbidden_keys = {
+                "anyOf", "oneOf", "allOf", "not", "patternProperties",
+                "dependencies", "dependentSchemas", "if", "then", "else"
+            }
+
+            # Root disqualifiers
+            if any(k in params for k in forbidden_keys):
+                return False
+            ap = params.get("additionalProperties")
+            if isinstance(ap, bool) and ap:  # True disqualifies (must be False/absent)
+                return False
+            if isinstance(ap, dict):        # schema form dynamic keys – disqualify
+                return False
+
+            def schema_invalid(s: Any, depth: int = 0) -> bool:
+                if not isinstance(s, dict):
+                    return False
+                t = s.get("type")
+                # Bad exported schemas sometimes have type == "anyof"
+                if isinstance(t, str) and t.lower() == "anyof":
+                    return True
+                if isinstance(t, list) and any(isinstance(x, str) and x.lower() == "anyof" for x in t):
+                    return True
+                if any(k in s for k in forbidden_keys):
+                    return True
+                # Disallow nested additionalProperties true / schema in strict mode (user requirement)
+                ap_local = s.get("additionalProperties")
+                if isinstance(ap_local, bool) and ap_local:
+                    return True
+                if isinstance(ap_local, dict):  # schema object
+                    return True
+                # Recurse minimal: items + nested object properties
+                if s.get("type") == "array" and isinstance(s.get("items"), dict):
+                    if schema_invalid(s["items"], depth + 1):
+                        return True
+                if s.get("type") == "object":
+                    nested_props = s.get("properties")
+                    if isinstance(nested_props, dict):
+                        for sub in nested_props.values():
+                            if schema_invalid(sub, depth + 1):
+                                return True
+                return False
+
+            for name, schema in props.items():
+                if schema_invalid(schema):
+                    return False
+
+            return True
+        except Exception:
+            return False
+        
     # -----------------------------------------------------------------------
     # Helper: turn the JSON string into valid MCP tool dicts
     # -----------------------------------------------------------------------
@@ -695,8 +777,7 @@ class Pipe:
         # TODO: Also detect body['tools'] and merge them with __tools__.  This would allow users to pass tools in the request body from filters, etc.
         if __tools__ and model_family in FEATURE_SUPPORT["function_calling"]:
             responses_body.tools = ResponsesBody.transform_tools(
-                tools=__tools__,
-                strict=True,
+                tools=__tools__
             )
 
         # Add web_search tool only if supported, enabled, and effort != minimal
