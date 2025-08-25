@@ -205,13 +205,20 @@ class ResponsesBody(BaseModel):
         # 2. strict-mode hardening per converted function tool -------------
         # Each tool is evaluated independently; compliant ones get strict=True.
         for tool in converted:
-            if ResponsesBody.validate_strict(tool):
+            strict = ResponsesBody.validate_strict(tool)
+            if strict:
                 params = tool.setdefault("parameters", {})
-                if "additionalProperties" not in params:
-                    params["additionalProperties"] = False
-                tool["strict"] = True
-            else:
-                tool["strict"] = False
+                props  = params.setdefault("properties", {})
+
+                # Root enforcement
+                params["additionalProperties"] = False
+                params["required"] = list(props.keys())
+
+                # Recurse into each top-level property schema
+                for s in props.values():
+                    ResponsesBody.harden_strict_schema(s)
+                    
+            tool["strict"] = strict
 
         # 3. deduplicate ---------------------------------------------------
         canonical: dict[str, dict] = {}
@@ -221,88 +228,76 @@ class ResponsesBody(BaseModel):
 
         return list(canonical.values())
 
+    @staticmethod
+    def harden_strict_schema(schema: dict) -> None:
+        """
+        Strictly normalizes and hardens a JSON schema dictionary in-place for OpenAI Response API strict = true.
+        This function enforces stricter schema validation by:
+        - Normalizing union type strings to a list of types.
+        - Setting 'additionalProperties' to False for objects.
+        - Marking all object properties as required.
+        - Recursively applying strictness to nested object properties and array items.
+        Args:
+            schema (dict): The JSON schema dictionary to be hardened.
+        Returns:
+            None
+        """
+        
+        if not isinstance(schema, dict):
+            return
 
+        # Normalize sloppy union type strings → list (no auto null)
+        t = schema.get("type")
+        if isinstance(t, str):
+            lower = t.lower().strip()
+            tokens = re.findall(r"(string|number|integer|boolean|object|array|null)", lower)
+            if tokens and (len(tokens) > 1 or any(x in lower for x in ("anyof", "oneof", "allof", "|", ","))):
+                # keep order, remove dups
+                schema["type"] = list(dict.fromkeys(tokens))
+
+        # Object properties
+        props = schema.get("properties")
+        if isinstance(props, dict) and props:
+            schema["additionalProperties"] = False
+            schema["required"] = list(props.keys())
+            for sub in props.values():
+                ResponsesBody.harden_strict_schema(sub)
+
+        # Array items
+        if schema.get("type") == "array" and isinstance(schema.get("items"), dict):
+            ResponsesBody.harden_strict_schema(schema["items"])
+            
     @staticmethod
     def validate_strict(tool: Dict[str, Any]) -> bool:
-        """Return True if the tool's JSON schema can be safely hardened for
-        OpenAI strict mode.
-
-                Heuristics (conservative – we only opt in if obviously safe):
-        - Tool type must be "function".
-        - parameters must be a dict (root object schema) with a non‑empty
-          "properties" dict.
-        - Reject if root or any property schema uses unsupported / complex
-          JSON Schema constructs (anyOf / oneOf / allOf / not / patternProperties
-          / dependencies / dependentSchemas / if / then / else).
-        - Reject if any schema's type is literally "anyof" (some bad exports
-                    put this into the type field) or if additionalProperties is truthy.
-                - In strict mode: additionalProperties MUST NOT be true or a schema at ANY level (root or nested).
-        - Reject object-typed properties that themselves have no properties
-          (ambiguous – would need user intent to mark required, so we skip).
-        - Allow optional null expansion; we will add "null" later when hardening.
+        """
+        Checks if the tool JSON schema can be safely hardened for OpenAI strict mode.
         """
         try:
             if not isinstance(tool, dict):
                 return False
-            if tool.get("type") != "function":
-                return False
+         
             params = tool.get("parameters")
             if not isinstance(params, dict):
                 return False
-            # Root should describe an object (OpenAI examples omit type sometimes)
-            root_type = params.get("type", "object")
-            if root_type != "object":
-                return False
+
             props = params.get("properties")
-            if not isinstance(props, dict):
-                return False  # must be dict (may be empty)
-
-            forbidden_keys = {
-                "anyOf", "oneOf", "allOf", "not", "patternProperties",
-                "dependencies", "dependentSchemas", "if", "then", "else"
-            }
-
-            # Root disqualifiers
-            if any(k in params for k in forbidden_keys):
-                return False
-            ap = params.get("additionalProperties")
-            if isinstance(ap, bool) and ap:  # True disqualifies (must be False/absent)
-                return False
-            if isinstance(ap, dict):        # schema form dynamic keys – disqualify
+            if not isinstance(props, dict) or not props:
                 return False
 
-            def schema_invalid(s: Any, depth: int = 0) -> bool:
-                if not isinstance(s, dict):
-                    return False
-                t = s.get("type")
-                # Bad exported schemas sometimes have type == "anyof"
-                if isinstance(t, str) and t.lower() == "anyof":
-                    return True
-                if isinstance(t, list) and any(isinstance(x, str) and x.lower() == "anyof" for x in t):
-                    return True
-                if any(k in s for k in forbidden_keys):
-                    return True
-                # Disallow nested additionalProperties true / schema in strict mode (user requirement)
-                ap_local = s.get("additionalProperties")
-                if isinstance(ap_local, bool) and ap_local:
-                    return True
-                if isinstance(ap_local, dict):  # schema object
-                    return True
-                # Recurse minimal: items + nested object properties
-                if s.get("type") == "array" and isinstance(s.get("items"), dict):
-                    if schema_invalid(s["items"], depth + 1):
+
+            def has_key_with_value(data, key, expected_value):
+                if isinstance(data, dict):
+                    # 1. Direkt prüfen
+                    if key in data and data[key] == expected_value:
                         return True
-                if s.get("type") == "object":
-                    nested_props = s.get("properties")
-                    if isinstance(nested_props, dict):
-                        for sub in nested_props.values():
-                            if schema_invalid(sub, depth + 1):
-                                return True
+                    # 2. Rekursiv weitersuchen
+                    return any(has_key_with_value(v, key, expected_value) for v in data.values())
+                elif isinstance(data, list):
+                    return any(has_key_with_value(item, key, expected_value) for item in data)
                 return False
 
-            for name, schema in props.items():
-                if schema_invalid(schema):
-                    return False
+            if has_key_with_value(params, "additionalProperties", True):
+                return False
 
             return True
         except Exception:
