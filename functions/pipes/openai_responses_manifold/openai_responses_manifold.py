@@ -532,7 +532,7 @@ class ResponsesBody(BaseModel):
             "functions", # Deprecated in favor of 'tools'.
 
             # Fields that are dropped and manually handled in step 2.
-            "reasoning_effort", "max_tokens"
+            "reasoning_effort", "max_tokens", "verbosity"
         }
         sanitized_params = {}
         for key, value in completions_dict.items():
@@ -552,6 +552,12 @@ class ResponsesBody(BaseModel):
             reasoning = sanitized_params.get("reasoning", {})
             reasoning.setdefault("effort", effort)
             sanitized_params["reasoning"] = reasoning
+
+        verbosity = completions_dict.get("verbosity")
+        if verbosity:
+            text = sanitized_params.get("text", {})
+            text.setdefault("verbosity", verbosity)
+            sanitized_params["text"] = text
 
         # Extract the last system message (if any)
         instructions = next((msg["content"] for msg in reversed(completions_dict.get("messages", [])) if msg["role"] == "system"), None)
